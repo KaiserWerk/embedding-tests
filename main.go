@@ -8,7 +8,6 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 )
 
@@ -353,40 +352,6 @@ func EmbedChunks(ctx context.Context, llmClient *Client, chunks []StoredChunk) [
 	return chunks
 }
 
-func FindTopChunks(
-	llmClient *Client,
-	input string,
-	chunks []StoredChunk,
-	topK int,
-	minScore float64,
-) []StoredChunk {
-	emb, err := llmClient.GetEmbedding(context.Background(), input)
-	if err != nil || len(emb.Data) == 0 {
-		return nil
-	}
-	q := emb.Data[0].Embedding
-
-	scored := make([]StoredChunk, 0, len(chunks))
-	for i := range chunks {
-		if len(chunks[i].Embedding) == 0 {
-			continue
-		}
-		chunks[i].Score = CosineSimilarity(q, chunks[i].Embedding)
-		if chunks[i].Score >= minScore {
-			scored = append(scored, chunks[i])
-		}
-	}
-
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
-	})
-
-	if topK > 0 && len(scored) > topK {
-		return scored[:topK]
-	}
-	return scored
-}
-
 func MergeTopChunksByParent(results []StoredChunk, maxPerParent int) []StoredChunk {
 	count := make(map[string]int)
 	var merged []StoredChunk
@@ -400,12 +365,22 @@ func MergeTopChunksByParent(results []StoredChunk, maxPerParent int) []StoredChu
 }
 
 func main() {
+	ctx := context.Background()
+
 	llmClient := NewClient(&AppConfig{
 		OpenAI: OpenAIConfig{
 			Endpoint: "http://localhost:8080",
 			APIKey:   "none",
 		},
 	})
+
+	store, err := NewPostgresStore(ctx, "localhost", 5432, "postgres", "password", "postgres")
+	if err != nil {
+		fmt.Println("Error connecting to PostgreSQL:", err)
+		return
+	}
+	defer store.Close()
+
 	chunks := load(llmClient)
 	if len(chunks) == 0 {
 		fmt.Println("No chunks loaded")
@@ -413,8 +388,25 @@ func main() {
 	}
 	fmt.Printf("Loaded %d chunks\n\n", len(chunks))
 
+	firstEmbedding := chunks[0].Embedding
+	if len(firstEmbedding) == 0 {
+		fmt.Println("No embedding found in first chunk")
+		return
+	}
+
+	if err := store.EnsureSchema(ctx, len(firstEmbedding)); err != nil {
+		fmt.Println("Error ensuring schema:", err)
+		return
+	}
+
+	if err := store.UpsertChunks(ctx, chunks); err != nil {
+		fmt.Println("Error upserting chunks:", err)
+		return
+	}
+	fmt.Println("Chunks persisted to PostgreSQL")
+
 	input := "Wozu dient der Stiftungsrat?"
-	results := find(llmClient, input, chunks)
+	results := find(ctx, llmClient, store, input)
 	fmt.Println("Results found:", len(results))
 	for _, result := range results {
 		fmt.Printf("\tTitle: %s\n\tDoknr: %s\n\tChunk: %d\n\tScore: %f\n\tText: %.100s...\n\n",
@@ -423,9 +415,18 @@ func main() {
 
 }
 
-func find(llmClient *Client, input string, chunks []StoredChunk) []StoredChunk {
-	// Find top chunks with semantic similarity
-	results := FindTopChunks(llmClient, input, chunks, 8, 0.6)
+func find(ctx context.Context, llmClient *Client, store *PostgresStore, input string) []StoredChunk {
+	inputEmbedding, err := llmClient.GetEmbedding(ctx, input)
+	if err != nil || len(inputEmbedding.Data) == 0 {
+		fmt.Println("Error getting input embedding:", err)
+		return nil
+	}
+
+	results, err := store.SearchTopChunks(ctx, inputEmbedding.Data[0].Embedding, 8, 0.6)
+	if err != nil {
+		fmt.Println("Error querying PostgreSQL chunks:", err)
+		return nil
+	}
 
 	// Optionally merge to at most 3 results per parent norm for cleaner output
 	merged := MergeTopChunksByParent(results, 2)
