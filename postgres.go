@@ -129,6 +129,51 @@ ON CONFLICT (chunk_id) DO UPDATE SET
 	return nil
 }
 
+func (s *PostgresStore) LoadChunks(ctx context.Context) ([]StoredChunk, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT
+	chunk_id,
+	parent_doknr,
+	parent_title,
+	chunk_index,
+	text,
+	start_para,
+	end_para,
+	embedding
+FROM norm_chunks
+ORDER BY parent_doknr, chunk_index`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: load chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var chunks []StoredChunk
+	for rows.Next() {
+		var chunk StoredChunk
+		var embedding pgvector.Vector
+		if err := rows.Scan(
+			&chunk.ChunkID,
+			&chunk.ParentDoknr,
+			&chunk.ParentTitle,
+			&chunk.ChunkIndex,
+			&chunk.Text,
+			&chunk.StartPara,
+			&chunk.EndPara,
+			&embedding,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: scan stored chunk: %w", err)
+		}
+		chunk.Embedding = embedding.Slice()
+		chunks = append(chunks, chunk)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate stored chunks: %w", err)
+	}
+
+	return chunks, nil
+}
+
 func (s *PostgresStore) SearchTopChunks(ctx context.Context, queryEmbedding []float32, topK int, minScore float64) ([]StoredChunk, error) {
 	if len(queryEmbedding) == 0 {
 		return nil, nil

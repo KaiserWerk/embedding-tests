@@ -364,8 +364,27 @@ func MergeTopChunksByParent(results []StoredChunk, maxPerParent int) []StoredChu
 	return merged
 }
 
+func embeddingDimension(chunks []StoredChunk) int {
+	for i := range chunks {
+		if len(chunks[i].Embedding) > 0 {
+			return len(chunks[i].Embedding)
+		}
+	}
+	return 0
+}
+
+func isIngestMode(args []string) bool {
+	for _, arg := range args[1:] {
+		if arg == "ingest" {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	ctx := context.Background()
+	ingestMode := isIngestMode(os.Args)
 
 	llmClient := NewClient(&AppConfig{
 		OpenAI: OpenAIConfig{
@@ -381,29 +400,44 @@ func main() {
 	}
 	defer store.Close()
 
-	chunks := load(llmClient)
+	var chunks []StoredChunk
+	if ingestMode {
+		chunks = load(llmClient)
+		if len(chunks) == 0 {
+			fmt.Println("No chunks loaded from source for ingest")
+			return
+		}
+		fmt.Printf("Loaded %d chunks from source\n\n", len(chunks))
+
+		dims := embeddingDimension(chunks)
+		if dims == 0 {
+			fmt.Println("No embeddings generated for ingest")
+			return
+		}
+
+		if err := store.EnsureSchema(ctx, dims); err != nil {
+			fmt.Println("Error ensuring schema:", err)
+			return
+		}
+
+		if err := store.UpsertChunks(ctx, chunks); err != nil {
+			fmt.Println("Error upserting chunks:", err)
+			return
+		}
+		fmt.Println("Chunks persisted to PostgreSQL")
+		return
+	}
+
+	chunks, err = store.LoadChunks(ctx)
+	if err != nil {
+		fmt.Println("Error loading chunks from PostgreSQL:", err)
+		return
+	}
 	if len(chunks) == 0 {
-		fmt.Println("No chunks loaded")
+		fmt.Println("No chunks loaded from PostgreSQL. Run with 'ingest' first.")
 		return
 	}
-	fmt.Printf("Loaded %d chunks\n\n", len(chunks))
-
-	firstEmbedding := chunks[0].Embedding
-	if len(firstEmbedding) == 0 {
-		fmt.Println("No embedding found in first chunk")
-		return
-	}
-
-	if err := store.EnsureSchema(ctx, len(firstEmbedding)); err != nil {
-		fmt.Println("Error ensuring schema:", err)
-		return
-	}
-
-	if err := store.UpsertChunks(ctx, chunks); err != nil {
-		fmt.Println("Error upserting chunks:", err)
-		return
-	}
-	fmt.Println("Chunks persisted to PostgreSQL")
+	fmt.Printf("Loaded %d chunks from PostgreSQL\n\n", len(chunks))
 
 	input := "Wozu dient der Stiftungsrat?"
 	results := find(ctx, llmClient, store, input)
