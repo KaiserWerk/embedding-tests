@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -59,7 +60,7 @@ type Fundstelle struct {
 	Zitstelle  string `xml:"zitstelle"`  // XML element
 }
 
-func load(llmClient *Client) []StoredNorm {
+func load(llmClient *Client) []StoredChunk {
 	xmlData, err := os.ReadFile("gii-toc.xml")
 	if err != nil {
 		fmt.Println("Error reading XML file:", err)
@@ -73,11 +74,6 @@ func load(llmClient *Client) []StoredNorm {
 		fmt.Println("Error unmarshalling XML:", err)
 		return nil
 	}
-
-	// print the unmarshalled items
-	// for _, item := range toc.Items {
-	// 	fmt.Printf("Title: %s, Link: %s\n", item.Title, item.Link)
-	// }
 
 	// work with first item
 	item := toc.Items[0]
@@ -122,7 +118,7 @@ func load(llmClient *Client) []StoredNorm {
 	firstFile := files[0]
 	fmt.Println("First file in unzipped folder:", firstFile.Name())
 
-	// unmarshal the XML file into a struct and print the title of the first item
+	// unmarshal the XML file into a struct
 	xmlFile, err := os.Open("unzipped/" + firstFile.Name())
 	if err != nil {
 		fmt.Println("Error opening XML file:", err)
@@ -144,7 +140,13 @@ func load(llmClient *Client) []StoredNorm {
 		return nil
 	}
 
-	var norms []StoredNorm
+	var allChunks []StoredChunk
+	chunkCfg := ChunkConfig{
+		TargetTokens:  250,
+		MaxTokens:     320,
+		OverlapTokens: 40,
+		MinTokens:     80,
+	}
 
 	for _, norm := range root.Norm {
 		title := norm.Metadaten.Titel
@@ -154,24 +156,19 @@ func load(llmClient *Client) []StoredNorm {
 		if title == "" {
 			continue
 		}
-		text := strings.Join(norm.Textdaten.Text.Content.P, "\n")
 
-		embedding, err := llmClient.GetEmbedding(context.Background(), text)
-		if err != nil {
-			fmt.Println("Error getting embedding for title:", err)
+		// build chunks from paragraphs
+		chunks := BuildChunksFromParagraphs(norm.Doknr, title, norm.Textdaten.Text.Content.P, chunkCfg)
+		if len(chunks) == 0 {
 			continue
 		}
 
-		norms = append(norms, StoredNorm{
-			Title:     title,
-			Doknr:     norm.Doknr,
-			Text:      text,
-			Embedding: embedding.Data[0].Embedding,
-		})
-		//fmt.Printf("Titel: %s\nDoknr: %s\nText: %v\n\n", title, norm.Doknr, norm.Textdaten.Text.Content.P)
+		// embed all chunks
+		chunks = EmbedChunks(context.Background(), llmClient, chunks)
+		allChunks = append(allChunks, chunks...)
 	}
 
-	return norms
+	return allChunks
 }
 
 type StoredNorm struct {
@@ -180,6 +177,25 @@ type StoredNorm struct {
 	Text      string
 	Embedding []float32
 	Score     float64
+}
+
+type StoredChunk struct {
+	ChunkID     string
+	ParentDoknr string
+	ParentTitle string
+	ChunkIndex  int
+	Text        string
+	Embedding   []float32
+	StartPara   int
+	EndPara     int
+	Score       float64
+}
+
+type ChunkConfig struct {
+	TargetTokens  int
+	MaxTokens     int
+	OverlapTokens int
+	MinTokens     int
 }
 
 func CosineSimilarity(a, b []float32) float64 {
@@ -201,6 +217,188 @@ func CosineSimilarity(a, b []float32) float64 {
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
+// ApproxTokenCount returns an approximate token count for a given string containing german text.
+func ApproxTokenCount(s string) int {
+	words := len(strings.Fields(s))
+	return int(float64(words) * 1.3)
+}
+
+// SplitIntoSentences splits text into sentences based on punctuation marks.
+func SplitIntoSentences(paragraph string) []string {
+	var sentences []string
+	current := ""
+	for _, char := range paragraph {
+		current += string(char)
+		if char == '.' || char == '!' || char == '?' {
+			s := strings.TrimSpace(current)
+			if s != "" {
+				sentences = append(sentences, s)
+			}
+			current = ""
+		}
+	}
+	if s := strings.TrimSpace(current); s != "" {
+		sentences = append(sentences, s)
+	}
+	return sentences
+}
+
+type ChunkPiece struct {
+	Text      string
+	ParaIndex int
+	Tokens    int
+}
+
+func BuildChunksFromParagraphs(
+	parentDoknr string,
+	parentTitle string,
+	paragraphs []string,
+	cfg ChunkConfig,
+) []StoredChunk {
+	var pieces []ChunkPiece
+	for i, p := range paragraphs {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		t := ApproxTokenCount(p)
+		if t <= cfg.MaxTokens {
+			pieces = append(pieces, ChunkPiece{Text: p, ParaIndex: i, Tokens: t})
+			continue
+		}
+		for _, s := range SplitIntoSentences(p) {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			pieces = append(pieces, ChunkPiece{
+				Text:      s,
+				ParaIndex: i,
+				Tokens:    ApproxTokenCount(s),
+			})
+		}
+	}
+
+	var out []StoredChunk
+	var cur []ChunkPiece
+	curTokens := 0
+	chunkIndex := 0
+
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		textParts := make([]string, 0, len(cur))
+		for _, cp := range cur {
+			textParts = append(textParts, cp.Text)
+		}
+		out = append(out, StoredChunk{
+			ChunkID:     fmt.Sprintf("%s:%d", parentDoknr, chunkIndex),
+			ParentDoknr: parentDoknr,
+			ParentTitle: parentTitle,
+			ChunkIndex:  chunkIndex,
+			Text:        strings.Join(textParts, " "),
+			StartPara:   cur[0].ParaIndex,
+			EndPara:     cur[len(cur)-1].ParaIndex,
+		})
+		chunkIndex++
+	}
+
+	i := 0
+	for i < len(pieces) {
+		next := pieces[i]
+		if curTokens+next.Tokens <= cfg.MaxTokens || len(cur) == 0 {
+			cur = append(cur, next)
+			curTokens += next.Tokens
+			i++
+			continue
+		}
+
+		if curTokens < cfg.MinTokens {
+			cur = append(cur, next)
+			curTokens += next.Tokens
+			i++
+		} else {
+			flush()
+
+			overlap := []ChunkPiece{}
+			overlapTokens := 0
+			for j := len(cur) - 1; j >= 0; j-- {
+				if overlapTokens+cur[j].Tokens > cfg.OverlapTokens && len(overlap) > 0 {
+					break
+				}
+				overlap = append([]ChunkPiece{cur[j]}, overlap...)
+				overlapTokens += cur[j].Tokens
+			}
+			cur = overlap
+			curTokens = overlapTokens
+		}
+	}
+
+	flush()
+	return out
+}
+
+func EmbedChunks(ctx context.Context, llmClient *Client, chunks []StoredChunk) []StoredChunk {
+	for i := range chunks {
+		embedding, err := llmClient.GetEmbedding(ctx, chunks[i].Text)
+		if err != nil {
+			fmt.Printf("Error getting embedding for chunk %s: %v\n", chunks[i].ChunkID, err)
+			continue
+		}
+		if len(embedding.Data) > 0 {
+			chunks[i].Embedding = embedding.Data[0].Embedding
+		}
+	}
+	return chunks
+}
+
+func FindTopChunks(
+	llmClient *Client,
+	input string,
+	chunks []StoredChunk,
+	topK int,
+	minScore float64,
+) []StoredChunk {
+	emb, err := llmClient.GetEmbedding(context.Background(), input)
+	if err != nil || len(emb.Data) == 0 {
+		return nil
+	}
+	q := emb.Data[0].Embedding
+
+	scored := make([]StoredChunk, 0, len(chunks))
+	for _, c := range chunks {
+		if len(c.Embedding) == 0 {
+			continue
+		}
+		c.Score = CosineSimilarity(q, c.Embedding)
+		if c.Score >= minScore {
+			scored = append(scored, c)
+		}
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
+	})
+
+	if topK > 0 && len(scored) > topK {
+		return scored[:topK]
+	}
+	return scored
+}
+
+func MergeTopChunksByParent(results []StoredChunk, maxPerParent int) []StoredChunk {
+	count := make(map[string]int)
+	var merged []StoredChunk
+	for _, chunk := range results {
+		if count[chunk.ParentDoknr] < maxPerParent {
+			merged = append(merged, chunk)
+			count[chunk.ParentDoknr]++
+		}
+	}
+	return merged
+}
+
 func main() {
 	llmClient := NewClient(&AppConfig{
 		OpenAI: OpenAIConfig{
@@ -208,33 +406,29 @@ func main() {
 			APIKey:   "none",
 		},
 	})
-	norms := load(llmClient)
-	input := "Welche Mitglieder hat der Stiftungsrat im Rahmen der 1-DM-Goldmünz-Gesetze?"
-	results := find(llmClient, input, norms)
-	fmt.Println("Result found:", len(results))
-	for _, result := range results {
-		fmt.Printf("Title: %s\nDoknr: %s\nScore: %f\n\n", result.Title, result.Doknr, result.Score)
+	chunks := load(llmClient)
+	if len(chunks) == 0 {
+		fmt.Println("No chunks loaded")
+		return
 	}
-	
+	fmt.Printf("Loaded %d chunks\n\n", len(chunks))
+
+	input := "Wozu dient der Stiftungsrat?"
+	results := find(llmClient, input, chunks)
+	fmt.Println("Results found:", len(results))
+	for _, result := range results {
+		fmt.Printf("\tTitle: %s\n\tDoknr: %s\n\tChunk: %d\n\tScore: %f\n\tText: %.100s...\n\n",
+			result.ParentTitle, result.ParentDoknr, result.ChunkIndex, result.Score, result.Text)
+	}
+
 }
 
-func find(llmClient *Client, input string, norms []StoredNorm) []StoredNorm {
-	// 1. Get embedding for input
+func find(llmClient *Client, input string, chunks []StoredChunk) []StoredChunk {
+	// Find top chunks with semantic similarity
+	results := FindTopChunks(llmClient, input, chunks, 8, 0.58)
 
-	inputEmbedding, err := llmClient.GetEmbedding(context.Background(), input)
-	if err != nil {
-		fmt.Println("Error getting embedding:", err)
-		return nil
-	}
-	// 2. Compare with stored norms and return the most similar ones
-	var results []StoredNorm
-	for _, norm := range norms {
-		norm.Score = CosineSimilarity(inputEmbedding.Data[0].Embedding, norm.Embedding)
-		if norm.Score > 0.75 {
-			results = append(results, norm)
-		} else {
-			fmt.Printf("Norm '%s' has low similarity score: %f\n", norm.Title, norm.Score)
-		}
-	}
-	return results
+	// Optionally merge to at most 3 results per parent norm for cleaner output
+	merged := MergeTopChunksByParent(results, 2)
+
+	return merged
 }
