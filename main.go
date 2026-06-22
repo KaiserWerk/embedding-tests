@@ -367,13 +367,13 @@ func FindTopChunks(
 	q := emb.Data[0].Embedding
 
 	scored := make([]StoredChunk, 0, len(chunks))
-	for _, c := range chunks {
-		if len(c.Embedding) == 0 {
+	for i := range chunks {
+		if len(chunks[i].Embedding) == 0 {
 			continue
 		}
-		c.Score = CosineSimilarity(q, c.Embedding)
-		if c.Score >= minScore {
-			scored = append(scored, c)
+		chunks[i].Score = CosineSimilarity(q, chunks[i].Embedding)
+		if chunks[i].Score >= minScore {
+			scored = append(scored, chunks[i])
 		}
 	}
 
@@ -390,10 +390,10 @@ func FindTopChunks(
 func MergeTopChunksByParent(results []StoredChunk, maxPerParent int) []StoredChunk {
 	count := make(map[string]int)
 	var merged []StoredChunk
-	for _, chunk := range results {
-		if count[chunk.ParentDoknr] < maxPerParent {
-			merged = append(merged, chunk)
-			count[chunk.ParentDoknr]++
+	for i := range results {
+		if count[results[i].ParentDoknr] < maxPerParent {
+			merged = append(merged, results[i])
+			count[results[i].ParentDoknr]++
 		}
 	}
 	return merged
@@ -425,7 +425,7 @@ func main() {
 
 func find(llmClient *Client, input string, chunks []StoredChunk) []StoredChunk {
 	// Find top chunks with semantic similarity
-	results := FindTopChunks(llmClient, input, chunks, 8, 0.58)
+	results := FindTopChunks(llmClient, input, chunks, 8, 0.6)
 
 	// Optionally merge to at most 3 results per parent norm for cleaner output
 	merged := MergeTopChunksByParent(results, 2)
