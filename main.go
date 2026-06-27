@@ -373,18 +373,11 @@ func embeddingDimension(chunks []StoredChunk) int {
 	return 0
 }
 
-func isIngestMode(args []string) bool {
-	for _, arg := range args[1:] {
-		if arg == "ingest" {
-			return true
-		}
-	}
-	return false
-}
-
 func main() {
 	ctx := context.Background()
-	ingestMode := isIngestMode(os.Args)
+	ingestMode := os.Args[1] == "ingest"
+	queryMode := os.Args[1] == "query"
+	input := strings.Join(os.Args[2:], " ")
 
 	llmClient := NewClient(&AppConfig{
 		OpenAI: OpenAIConfig{
@@ -428,25 +421,25 @@ func main() {
 		return
 	}
 
-	chunks, err = store.LoadChunks(ctx)
-	if err != nil {
-		fmt.Println("Error loading chunks from PostgreSQL:", err)
-		return
-	}
-	if len(chunks) == 0 {
-		fmt.Println("No chunks loaded from PostgreSQL. Run with 'ingest' first.")
-		return
-	}
-	fmt.Printf("Loaded %d chunks from PostgreSQL\n\n", len(chunks))
+	if queryMode {
+		chunks, err = store.LoadChunks(ctx)
+		if err != nil {
+			fmt.Println("Error loading chunks from PostgreSQL:", err)
+			return
+		}
+		if len(chunks) == 0 {
+			fmt.Println("No chunks loaded from PostgreSQL. Run with 'ingest' first.")
+			return
+		}
+		fmt.Printf("Loaded %d chunks from PostgreSQL\n\n", len(chunks))
 
-	input := "Wozu dient der Stiftungsrat?"
-	results := find(ctx, llmClient, store, input)
-	fmt.Println("Results found:", len(results))
-	for _, result := range results {
-		fmt.Printf("\tTitle: %s\n\tDoknr: %s\n\tChunk: %d\n\tScore: %f\n\tText: %.100s...\n\n",
-			result.ParentTitle, result.ParentDoknr, result.ChunkIndex, result.Score, result.Text)
+		results := find(ctx, llmClient, store, input)
+		fmt.Println("Results found:", len(results))
+		for _, result := range results {
+			fmt.Printf("\tTitle: %s\n\tDoknr: %s\n\tChunk: %d\n\tScore: %f\n\tText: %.100s...\n\n",
+				result.ParentTitle, result.ParentDoknr, result.ChunkIndex, result.Score, result.Text)
+		}
 	}
-
 }
 
 func find(ctx context.Context, llmClient *Client, store *PostgresStore, input string) []StoredChunk {
