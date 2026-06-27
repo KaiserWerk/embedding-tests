@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,6 +45,10 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context, embeddingDims int) err
 		return fmt.Errorf("postgres: create extension vector: %w", err)
 	}
 
+	if _, err := s.pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pg_textsearch"); err != nil {
+		return fmt.Errorf("postgres: create extension pg_textsearch: %w", err)
+	}
+
 	createTableSQL := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS norm_chunks (
 	chunk_id      TEXT PRIMARY KEY,
@@ -57,6 +62,14 @@ CREATE TABLE IF NOT EXISTS norm_chunks (
 )`, embeddingDims)
 	if _, err := s.pool.Exec(ctx, createTableSQL); err != nil {
 		return fmt.Errorf("postgres: create table norm_chunks: %w", err)
+	}
+
+	if _, err := s.pool.Exec(ctx, `
+CREATE INDEX IF NOT EXISTS idx_norm_chunks_bm25
+ON norm_chunks
+USING bm25 ((coalesce(parent_title, '') || ' ' || text))
+WITH (text_config='english')`); err != nil {
+		return fmt.Errorf("postgres: create bm25 index: %w", err)
 	}
 
 	if _, err := s.pool.Exec(ctx, `
@@ -175,6 +188,10 @@ ORDER BY parent_doknr, chunk_index`)
 }
 
 func (s *PostgresStore) SearchTopChunks(ctx context.Context, queryEmbedding []float32, topK int, minScore float64) ([]StoredChunk, error) {
+	return s.SearchVectorTopChunks(ctx, queryEmbedding, topK, minScore)
+}
+
+func (s *PostgresStore) SearchVectorTopChunks(ctx context.Context, queryEmbedding []float32, topK int, minScore float64) ([]StoredChunk, error) {
 	if len(queryEmbedding) == 0 {
 		return nil, nil
 	}
@@ -217,6 +234,7 @@ LIMIT $3
 		); err != nil {
 			return nil, fmt.Errorf("postgres: scan result row: %w", err)
 		}
+		c.SemanticScore = c.Score
 		results = append(results, c)
 	}
 
@@ -225,4 +243,122 @@ LIMIT $3
 	}
 
 	return results, nil
+}
+
+func (s *PostgresStore) SearchBM25TopChunks(ctx context.Context, queryText string, topK int) ([]StoredChunk, error) {
+	if queryText == "" {
+		return nil, nil
+	}
+	if topK <= 0 {
+		topK = 8
+	}
+
+	rows, err := s.pool.Query(ctx, `
+SELECT
+	chunk_id,
+	parent_doknr,
+	parent_title,
+	chunk_index,
+	text,
+	start_para,
+	end_para,
+	(coalesce(parent_title, '') || ' ' || text) <@> to_bm25query($1, 'idx_norm_chunks_bm25') AS score
+FROM norm_chunks
+ORDER BY (coalesce(parent_title, '') || ' ' || text) <@> to_bm25query($1, 'idx_norm_chunks_bm25')
+LIMIT $2
+`, queryText, topK)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: query bm25 chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var results []StoredChunk
+	for rows.Next() {
+		var c StoredChunk
+		if err := rows.Scan(
+			&c.ChunkID,
+			&c.ParentDoknr,
+			&c.ParentTitle,
+			&c.ChunkIndex,
+			&c.Text,
+			&c.StartPara,
+			&c.EndPara,
+			&c.Score,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: scan bm25 result row: %w", err)
+		}
+		c.KeywordScore = c.Score
+		results = append(results, c)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: bm25 row iteration error: %w", err)
+	}
+
+	return results, nil
+}
+
+func (s *PostgresStore) SearchHybridChunks(ctx context.Context, queryEmbedding []float32, queryText string, topK int) ([]StoredChunk, error) {
+	if topK <= 0 {
+		topK = 8
+	}
+
+	vectorResults, err := s.SearchVectorTopChunks(ctx, queryEmbedding, topK*3, 0.6)
+	if err != nil {
+		return nil, err
+	}
+
+	keywordResults, err := s.SearchBM25TopChunks(ctx, queryText, topK*3)
+	if err != nil {
+		return nil, err
+	}
+
+	const rrfK = 60.0
+	type fusedResult struct {
+		StoredChunk
+	}
+
+	byChunkID := make(map[string]*fusedResult)
+	add := func(results []StoredChunk, source string) {
+		for rank, chunk := range results {
+			entry, ok := byChunkID[chunk.ChunkID]
+			if !ok {
+				entry = &fusedResult{StoredChunk: chunk}
+				byChunkID[chunk.ChunkID] = entry
+			}
+
+			switch source {
+			case "vector":
+				entry.SemanticScore = chunk.SemanticScore
+			case "keyword":
+				entry.KeywordScore = chunk.KeywordScore
+			}
+
+			entry.Score += 1.0 / (rrfK + float64(rank+1))
+		}
+	}
+
+	add(vectorResults, "vector")
+	add(keywordResults, "keyword")
+
+	merged := make([]StoredChunk, 0, len(byChunkID))
+	for _, entry := range byChunkID {
+		merged = append(merged, entry.StoredChunk)
+	}
+
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].Score == merged[j].Score {
+			if merged[i].ParentDoknr == merged[j].ParentDoknr {
+				return merged[i].ChunkIndex < merged[j].ChunkIndex
+			}
+			return merged[i].ParentDoknr < merged[j].ParentDoknr
+		}
+		return merged[i].Score > merged[j].Score
+	})
+
+	if len(merged) > topK {
+		merged = merged[:topK]
+	}
+
+	return merged, nil
 }

@@ -59,7 +59,7 @@ type Fundstelle struct {
 	Zitstelle  string `xml:"zitstelle"`  // XML element
 }
 
-func load(llmClient *Client) []StoredChunk {
+func load(embeddingClient *EmbeddingClient) []StoredChunk {
 	xmlData, err := os.ReadFile("gii-toc.xml")
 	if err != nil {
 		fmt.Println("Error reading XML file:", err)
@@ -163,7 +163,7 @@ func load(llmClient *Client) []StoredChunk {
 		}
 
 		// embed all chunks
-		chunks = EmbedChunks(context.Background(), llmClient, chunks)
+		chunks = EmbedChunks(context.Background(), embeddingClient, chunks)
 		allChunks = append(allChunks, chunks...)
 	}
 
@@ -179,15 +179,17 @@ type StoredNorm struct {
 }
 
 type StoredChunk struct {
-	ChunkID     string
-	ParentDoknr string
-	ParentTitle string
-	ChunkIndex  int
-	Text        string
-	Embedding   []float32
-	StartPara   int
-	EndPara     int
-	Score       float64
+	ChunkID       string
+	ParentDoknr   string
+	ParentTitle   string
+	ChunkIndex    int
+	Text          string
+	Embedding     []float32
+	StartPara     int
+	EndPara       int
+	Score         float64
+	SemanticScore float64
+	KeywordScore  float64
 }
 
 type ChunkConfig struct {
@@ -338,9 +340,9 @@ func BuildChunksFromParagraphs(
 	return out
 }
 
-func EmbedChunks(ctx context.Context, llmClient *Client, chunks []StoredChunk) []StoredChunk {
+func EmbedChunks(ctx context.Context, embeddingClient *EmbeddingClient, chunks []StoredChunk) []StoredChunk {
 	for i := range chunks {
-		embedding, err := llmClient.GetEmbedding(ctx, chunks[i].Text)
+		embedding, err := embeddingClient.GetEmbedding(ctx, chunks[i].Text)
 		if err != nil {
 			fmt.Printf("Error getting embedding for chunk %s: %v\n", chunks[i].ChunkID, err)
 			continue
@@ -379,12 +381,14 @@ func main() {
 	queryMode := os.Args[1] == "query"
 	input := strings.Join(os.Args[2:], " ")
 
-	llmClient := NewClient(&AppConfig{
-		OpenAI: OpenAIConfig{
-			Endpoint: "http://localhost:8080",
-			APIKey:   "none",
-		},
-	})
+	config, err := LoadConfig("config.yaml", "")
+	if err != nil {
+		fmt.Println("Error loading config:", err)
+		return
+	}
+
+	llmClient := NewLLMClient(config)
+	embeddingClient := NewEmbeddingClient(config)
 
 	store, err := NewPostgresStore(ctx, "localhost", 5432, "postgres", "password", "postgres")
 	if err != nil {
@@ -395,7 +399,7 @@ func main() {
 
 	var chunks []StoredChunk
 	if ingestMode {
-		chunks = load(llmClient)
+		chunks = load(embeddingClient)
 		if len(chunks) == 0 {
 			fmt.Println("No chunks loaded from source for ingest")
 			return
@@ -422,6 +426,11 @@ func main() {
 	}
 
 	if queryMode {
+
+		if err := store.EnsureSchema(ctx, 1536); err != nil {
+			fmt.Println("Error ensuring schema:", err)
+			return
+		}
 		chunks, err = store.LoadChunks(ctx)
 		if err != nil {
 			fmt.Println("Error loading chunks from PostgreSQL:", err)
@@ -433,30 +442,105 @@ func main() {
 		}
 		fmt.Printf("Loaded %d chunks from PostgreSQL\n\n", len(chunks))
 
-		results := find(ctx, llmClient, store, input)
+		results := find(ctx, embeddingClient, store, input)
 		fmt.Println("Results found:", len(results))
 		for _, result := range results {
-			fmt.Printf("\tTitle: %s\n\tDoknr: %s\n\tChunk: %d\n\tScore: %f\n\tText: %.100s...\n\n",
-				result.ParentTitle, result.ParentDoknr, result.ChunkIndex, result.Score, result.Text)
+			fmt.Printf("\tTitle: %s\n\tDoknr: %s\n\tChunk: %d\n\tHybrid: %f\n\tVector: %f\n\tKeyword: %f\n\tText: %.100s...\n\n",
+				result.ParentTitle, result.ParentDoknr, result.ChunkIndex, result.Score, result.SemanticScore, result.KeywordScore, result.Text)
 		}
+
+		answer, err := answerFromHybridResults(ctx, llmClient, input, results)
+		if err != nil {
+			fmt.Println("Error generating final answer:", err)
+			return
+		}
+
+		fmt.Println("Final answer:")
+		fmt.Println(answer)
 	}
 }
 
-func find(ctx context.Context, llmClient *Client, store *PostgresStore, input string) []StoredChunk {
-	inputEmbedding, err := llmClient.GetEmbedding(ctx, input)
+func find(ctx context.Context, embeddingClient *EmbeddingClient, store *PostgresStore, input string) []StoredChunk {
+	inputEmbedding, err := embeddingClient.GetEmbedding(ctx, input)
 	if err != nil || len(inputEmbedding.Data) == 0 {
 		fmt.Println("Error getting input embedding:", err)
 		return nil
 	}
 
-	results, err := store.SearchTopChunks(ctx, inputEmbedding.Data[0].Embedding, 8, 0.6)
+	results, err := store.SearchHybridChunks(ctx, inputEmbedding.Data[0].Embedding, input, 8)
 	if err != nil {
 		fmt.Println("Error querying PostgreSQL chunks:", err)
 		return nil
 	}
 
-	// Optionally merge to at most 3 results per parent norm for cleaner output
+	// Optionally merge to at most 2 results per parent norm for cleaner output.
 	merged := MergeTopChunksByParent(results, 2)
 
 	return merged
+}
+
+func answerFromHybridResults(ctx context.Context, llmClient *LLMClient, question string, chunks []StoredChunk) (string, error) {
+	if strings.TrimSpace(question) == "" {
+		return "", fmt.Errorf("question is empty")
+	}
+	if len(chunks) == 0 {
+		return "", fmt.Errorf("no retrieved chunks available")
+	}
+
+	const maxChunks = 6
+	const maxCharsPerChunk = 900
+
+	var b strings.Builder
+	limit := len(chunks)
+	if limit > maxChunks {
+		limit = maxChunks
+	}
+
+	for i := 0; i < limit; i++ {
+		text := strings.TrimSpace(chunks[i].Text)
+		if len(text) > maxCharsPerChunk {
+			text = text[:maxCharsPerChunk] + "..."
+		}
+
+		fmt.Fprintf(&b,
+			"Source %d\nDoknr: %s\nTitle: %s\nChunk: %d\nHybrid: %.6f\nVector: %.6f\nKeyword: %.6f\nText: %s\n\n",
+			i+1,
+			chunks[i].ParentDoknr,
+			chunks[i].ParentTitle,
+			chunks[i].ChunkIndex,
+			chunks[i].Score,
+			chunks[i].SemanticScore,
+			chunks[i].KeywordScore,
+			text,
+		)
+	}
+
+	req := ChatRequest{
+		Messages: []Message{
+			{
+				Role:    "system",
+				Content: "You are a legal QA assistant. Answer only with information grounded in the provided retrieval context. If the context is insufficient, say clearly what is missing. Keep the answer concise and factual.",
+			},
+			{
+				Role:    "user",
+				Content: "Question:\n" + question + "\n\nRetrieved context:\n" + b.String() + "Please answer in German and mention the most relevant Doknr references.",
+			},
+		},
+		Model: llmClient.cfg.OpenAI.Model,
+	}
+
+	resp, err := llmClient.Chat(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("chat response returned no choices")
+	}
+
+	answer := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if answer == "" {
+		return "", fmt.Errorf("chat response was empty")
+	}
+
+	return answer, nil
 }

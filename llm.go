@@ -7,82 +7,26 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 )
 
-// Client sends requests to an OpenAI-compatible chat-completions endpoint.
-type Client struct {
+// LLMClient sends requests to an OpenAI-compatible chat-completions endpoint.
+type LLMClient struct {
 	cfg        *AppConfig
 	httpClient *http.Client
 }
 
-// NewClient creates a new LLM client with the given configuration.
-func NewClient(cfg *AppConfig) *Client {
-	return &Client{
+// NewLLMClient creates a new LLM client with the given configuration.
+func NewLLMClient(cfg *AppConfig) *LLMClient {
+	return &LLMClient{
 		cfg:        cfg,
-		httpClient: &http.Client{},
+		httpClient: &http.Client{Timeout: cfg.Timeout},
 	}
-}
-
-func (c *Client) GetEmbedding(ctx context.Context, input string) (*EmbeddingResponse, error) {
-	req := EmbeddingRequest{
-		Input: input,
-		Model: c.cfg.OpenAI.EmbeddingModel,
-	}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("llm: marshal embedding request: %w", err)
-	}
-
-	if c.cfg.Timeout <= 0 {
-		c.cfg.Timeout = 30 * time.Second
-	}
-
-	tctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
-	defer cancel()
-
-	url := c.cfg.OpenAI.Endpoint + "/v1/embeddings"
-	httpReq, err := http.NewRequestWithContext(tctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("llm: build request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.cfg.OpenAI.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.OpenAI.APIKey)
-	}
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("llm: http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("llm: read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("llm: API returned HTTP %d: %s", resp.StatusCode, rawBody)
-	}
-
-	var embeddingResp EmbeddingResponse
-	if err := json.Unmarshal(rawBody, &embeddingResp); err != nil {
-		return nil, fmt.Errorf("llm: unmarshal response: %w", err)
-	}
-
-	if embeddingResp.Error != nil {
-		return nil, fmt.Errorf("llm: API error (%s): %s", embeddingResp.Error.Type, embeddingResp.Error.Message)
-	}
-
-	return &embeddingResp, nil
 }
 
 // Chat sends a chat-completions request and returns the API response.
 // Pass a non-nil ctx to control cancellation externally; the client will
 // additionally enforce cfg.Timeout around every call.
-func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+func (c *LLMClient) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	req.Model = c.cfg.OpenAI.Model
 
 	if len(req.Tools) > 0 && req.ToolChoice == "" {
@@ -182,11 +126,6 @@ type ToolCallFunction struct {
 	Arguments string `json:"arguments"` // JSON-encoded arguments object
 }
 
-type EmbeddingRequest struct {
-	Input string `json:"input"`
-	Model string `json:"model"`
-}
-
 // ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
@@ -212,22 +151,3 @@ type APIError struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 }
-
-type (
-	EmbeddingResponse struct {
-		Error  *APIError `json:"error,omitempty"`
-		Data   []Data    `json:"data"`
-		Model  string    `json:"model"`
-		Object string    `json:"object"`
-		Usage  Usage     `json:"usage"`
-	}
-	Data struct {
-		Embedding []float32 `json:"embedding"`
-		Index     int       `json:"index"`
-		Object    string    `json:"object"`
-	}
-	Usage struct {
-		PromptTokens int `json:"prompt_tokens"`
-		TotalTokens  int `json:"total_tokens"`
-	}
-)
