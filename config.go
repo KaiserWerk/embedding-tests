@@ -10,21 +10,21 @@ import (
 )
 
 type AppConfig struct {
-	OpenAI    OpenAIConfig    `json:"openai"`
-	Embedding EmbeddingConfig `json:"embedding"`
-	Timeout   time.Duration   `json:"timeout"`
+	OpenAI    OpenAIConfig    `yaml:"openai"`
+	Embedding EmbeddingConfig `yaml:"embedding"`
+	Timeout   time.Duration   `yaml:"timeout"`
 }
 
 type OpenAIConfig struct {
-	Endpoint string `json:"endpoint"`
-	Model    string `json:"model"`
-	APIKey   string `json:"api_key"`
+	Endpoint string `yaml:"endpoint"`
+	Model    string `yaml:"model"`
+	APIKey   string `yaml:"api_key"`
 }
 
 type EmbeddingConfig struct {
-	Endpoint       string `json:"endpoint"`
-	EmbeddingModel string `json:"embedding_model"`
-	APIKey         string `json:"api_key"`
+	Endpoint       string `yaml:"endpoint"`
+	EmbeddingModel string `yaml:"embedding_model"`
+	APIKey         string `yaml:"api_key"`
 }
 
 func LoadConfig(configFile, envFile string) (*AppConfig, error) {

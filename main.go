@@ -377,6 +377,10 @@ func embeddingDimension(chunks []StoredChunk) int {
 
 func main() {
 	ctx := context.Background()
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go [ingest|query] [query text]")
+		return
+	}
 	ingestMode := os.Args[1] == "ingest"
 	queryMode := os.Args[1] == "query"
 	input := strings.Join(os.Args[2:], " ")
