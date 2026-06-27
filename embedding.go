@@ -54,7 +54,7 @@ func (c *EmbeddingClient) GetEmbedding(ctx context.Context, input string) (*Embe
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("llm: marshal embedding request: %w", err)
+		return nil, fmt.Errorf("embedding: marshal embedding request: %w", err)
 	}
 
 	if c.cfg.Timeout <= 0 {
@@ -67,7 +67,7 @@ func (c *EmbeddingClient) GetEmbedding(ctx context.Context, input string) (*Embe
 	url := c.cfg.Embedding.Endpoint + "/v1/embeddings"
 	httpReq, err := http.NewRequestWithContext(tctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("llm: build request: %w", err)
+		return nil, fmt.Errorf("embedding: build request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -77,26 +77,26 @@ func (c *EmbeddingClient) GetEmbedding(ctx context.Context, input string) (*Embe
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("llm: http request: %w", err)
+		return nil, fmt.Errorf("embedding: http request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("llm: read response body: %w", err)
+		return nil, fmt.Errorf("embedding: read response body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("llm: API returned HTTP %d: %s", resp.StatusCode, rawBody)
+		return nil, fmt.Errorf("embedding: API returned HTTP %d: %s", resp.StatusCode, rawBody)
 	}
 
 	var embeddingResp EmbeddingResponse
 	if err := json.Unmarshal(rawBody, &embeddingResp); err != nil {
-		return nil, fmt.Errorf("llm: unmarshal response: %w", err)
+		return nil, fmt.Errorf("embedding: unmarshal response: %w", err)
 	}
 
 	if embeddingResp.Error != nil {
-		return nil, fmt.Errorf("llm: API error (%s): %s", embeddingResp.Error.Type, embeddingResp.Error.Message)
+		return nil, fmt.Errorf("embedding: API error (%s): %s", embeddingResp.Error.Type, embeddingResp.Error.Message)
 	}
 
 	return &embeddingResp, nil
